@@ -14,9 +14,14 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_set>
 
 #include "config.h"
 #include "multi_transport_locality.h"
@@ -88,7 +93,16 @@ MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
 
-MultiTransport::~MultiTransport() {}
+MultiTransport::~MultiTransport() {
+    {
+        std::lock_guard<std::mutex> lock(deferred_cleanup_mutex_);
+        stop_deferred_cleanup_ = true;
+    }
+    deferred_cleanup_cv_.notify_all();
+    if (deferred_cleanup_thread_.joinable()) {
+        deferred_cleanup_thread_.join();
+    }
+}
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     auto batch_desc = new BatchDesc();
@@ -106,6 +120,37 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    std::lock_guard<std::mutex> lock(deferred_cleanup_mutex_);
+    if (deferred_cleanup_batches_.count(batch_id) != 0) {
+        return Status::OK();
+    }
+    Status status = tryFreeBatchID(batch_id);
+    if (status.ok() || !status.IsBatchBusy()) {
+        return status;
+    }
+    // Defer reclamation until completion handlers have returned.
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    bool finished = true;
+    for (size_t task_id = 0; task_id < batch_desc.task_list.size();
+         task_id++) {
+        if (!batch_desc.task_list[task_id].is_finished) {
+            finished = false;
+            break;
+        }
+    }
+    if (!finished) {
+        return status;
+    }
+    deferred_cleanup_batches_.insert(batch_id);
+    if (!deferred_cleanup_thread_.joinable()) {
+        deferred_cleanup_thread_ =
+            std::thread(&MultiTransport::deferredCleanupLoop, this);
+    }
+    deferred_cleanup_cv_.notify_one();
+    return Status::OK();
+}
+
+Status MultiTransport::tryFreeBatchID(BatchID batch_id) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -114,12 +159,47 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
                 "BatchID cannot be freed until all tasks are done");
         }
     }
-    delete &batch_desc;
+    if (batch_desc.inflight_completions.load(std::memory_order_acquire) != 0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until completion handlers return");
+    }
 #ifdef CONFIG_USE_BATCH_DESC_SET
-    RWSpinlock::WriteGuard guard(batch_desc_lock_);
-    batch_desc_set_.erase(batch_id);
+    {
+        RWSpinlock::WriteGuard guard(batch_desc_lock_);
+        batch_desc_set_.erase(batch_id);
+    }
 #endif
+    delete &batch_desc;
     return Status::OK();
+}
+
+void MultiTransport::deferredCleanupLoop() {
+    std::unique_lock<std::mutex> lock(deferred_cleanup_mutex_);
+    while (true) {
+        if (deferred_cleanup_batches_.empty()) {
+            if (stop_deferred_cleanup_) {
+                return;
+            }
+            deferred_cleanup_cv_.wait(lock, [this] {
+                return stop_deferred_cleanup_ ||
+                       !deferred_cleanup_batches_.empty();
+            });
+            continue;
+        }
+        for (auto it = deferred_cleanup_batches_.begin();
+             it != deferred_cleanup_batches_.end();) {
+            Status status = tryFreeBatchID(*it);
+            if (status.ok()) {
+                it = deferred_cleanup_batches_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (stop_deferred_cleanup_) {
+            return;
+        }
+        deferred_cleanup_cv_.wait_for(lock, std::chrono::milliseconds(1));
+    }
 }
 
 Status MultiTransport::submitTransfer(
@@ -366,11 +446,21 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
-        task_count == 0) {
+    const bool batch_finished =
+        batch_desc.is_finished.load(std::memory_order_acquire);
+    const bool completions_idle =
+        batch_desc.inflight_completions.load(std::memory_order_acquire) == 0;
+    if ((batch_finished && completions_idle) ||
+        (task_count == 0 && completions_idle)) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
             batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
+        return Status::OK();
+    }
+
+    // Do not publish completion while a callback still owns the batch.
+    if ((batch_finished || task_count == 0) && !completions_idle) {
+        status.s = Transport::TransferStatusEnum::WAITING;
         return Status::OK();
     }
 
@@ -394,13 +484,16 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         }
     }
 
-    status.s = (success_count == task_count)
+    const bool all_tasks_finished = success_count == task_count;
+    const bool callbacks_idle =
+        batch_desc.inflight_completions.load(std::memory_order_acquire) == 0;
+    status.s = (all_tasks_finished && callbacks_idle)
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.is_finished.store(true, std::memory_order_release);
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
                                                  std::memory_order_release);
+        batch_desc.is_finished.store(true, std::memory_order_release);
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }

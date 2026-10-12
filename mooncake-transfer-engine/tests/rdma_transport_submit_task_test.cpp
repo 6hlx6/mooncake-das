@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -194,6 +195,28 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
                                                         request_statuses),
               Status::OK());
     EXPECT_EQ(request_statuses, std::vector(2, status.s));
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(SubmitTransferTaskTest, WaitsForCompletionCallbackBeforePublishingDone) {
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(metadata_, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    auto *batch = reinterpret_cast<Transport::BatchDesc *>(batch_id);
+    batch->task_list.emplace_back();
+    batch->task_list[0].is_finished = true;
+    batch->is_finished.store(true, std::memory_order_release);
+    batch->inflight_completions.store(1, std::memory_order_release);
+
+    Transport::TransferStatus status;
+    ASSERT_EQ(multi_transport.getBatchTransferStatus(batch_id, status),
+              Status::OK());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::WAITING);
+
+    batch->inflight_completions.store(0, std::memory_order_release);
+    ASSERT_EQ(multi_transport.getBatchTransferStatus(batch_id, status),
+              Status::OK());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
 }  // namespace

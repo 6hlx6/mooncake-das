@@ -775,6 +775,7 @@ int TransferEnginePy::getBatchTransferStatus(
             Status s = engine_->getBatchTransferStatus(entry.first, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
+                // freeBatchID may defer deletion until callbacks return.
                 engine_->freeBatchID(entry.first);
                 LOG(INFO) << "Batch Transfer completed!";
                 remove_ids.insert(entry.first);

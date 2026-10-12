@@ -204,19 +204,27 @@ class Transport {
 
        public:
         void markSuccess() {
+            auto &batch_desc = toBatchDesc(task->batch_id);
+            batch_desc.inflight_completions.fetch_add(
+                1, std::memory_order_acq_rel);
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
-
             check_batch_completion(task, false);
+            batch_desc.inflight_completions.fetch_sub(
+                1, std::memory_order_acq_rel);
         }
 
         void markFailed() {
+            auto &batch_desc = toBatchDesc(task->batch_id);
+            batch_desc.inflight_completions.fetch_add(
+                1, std::memory_order_acq_rel);
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
-
             check_batch_completion(task, true);
+            batch_desc.inflight_completions.fetch_sub(
+                1, std::memory_order_acq_rel);
         }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
@@ -397,6 +405,8 @@ class Transport {
         std::mutex completion_mutex;
         std::condition_variable completion_cv;
 #endif
+        // Completion callbacks must return before reclamation.
+        std::atomic<int> inflight_completions{0};
     };
 
    public:
